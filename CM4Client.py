@@ -1,11 +1,19 @@
+# Created on Jan 21 2025 , Severin Konishi
 from LogLib import LogFile
 from framework import *
 from datetime import datetime
 import traceback
+import RPi.GPIO as GPIO
+
+#Show that the client started by turning user LED ON(mainly for autostart)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(23, GPIO.OUT)
+GPIO.output(23, 1)
 
 #number of modules (=number of motors/joints, the head is not counted as module)
-MOD_NUM = 4
+MOD_NUM = 2
 
+# ===== Register Map ===== #
 # Base Registers
 REG_TIMESTAMP =      		0x0000
 REG_COM_ID_PROPAGATION = 	0x0001
@@ -60,6 +68,8 @@ help_print = [{"command": "exit", "description":"Close the shell"},
               {"command": "uartw ADDRESS VALUE", "description":"Write a register through UART"},
               {"command": "canr ADDRESS DEVICE_ADDRESS", "description":"Read a register through CANFD1"},
               {"command": "canw ADDRESS VALUE DEVICE_ADDRESS", "description":"Write a register through CANFD1"},
+              {"command": "robot start", "description": "enable the motors and start logging"},
+              {"command": "robot stop", "description": "disable the motors and stop logging"},
               {"command": "cpg  freq VALUE", "description": "set the frequency cpg parameter"},
               {"command": "cpg  dir VALUE", "description": "set the direction cpg parameter"},
               {"command": "cpg  amplc VALUE", "description": "set the amplc cpg parameter"},
@@ -98,7 +108,7 @@ framework.RegisterAdd(REG_CPG_AMPLC_MAX, REG_TYPE_FLOAT, 0)
 framework.RegisterAdd(REG_CPG_AMPLH_MAX, REG_TYPE_FLOAT, 0)
 
 # === Remote registers === #
-framework.RegisterAdd(REG_REMOTE_MODE, REG_TYPE_UINT8, 0, event_type=EVENT_TYPE_UPDATE)
+framework.RegisterAdd(REG_REMOTE_MODE, REG_TYPE_UINT8, 0, event_type=EVENT_TYPE_ALWAYS)
 framework.RegisterAdd(REG_REMOTE_ELT_NB, REG_TYPE_UINT8, 0)
 framework.RegisterAdd(REG_REMOTE_SPEED, REG_TYPE_UINT8, 0)
 framework.RegisterAdd(REG_REMOTE_FREQUENCY, REG_TYPE_UINT8, 0)
@@ -117,10 +127,6 @@ log_cpg = LogFile()
 joint_keys = ["joint{0}".format(i) for i in range(MOD_NUM)]
 energy_keys = ["energy{0}".format(i) for i in range(MOD_NUM)]
 power_keys = ["power{0}".format(i) for i in range(MOD_NUM)]
-#For easier log file initialization
-log_data_init = {}
-for key in (joint_keys + energy_keys + power_keys):
-    log_data_init[key] = 0.0
 
 # === UART thread === #
 def ThreadUart():
@@ -132,8 +138,9 @@ def ThreadCan():
 
 # === Log Thread === #
 thread_log_run = True
+log_print_queue = queue.Queue()
 def ThreadLog():
-    #read the inital cpg parameters (will be updated automatically by the STM publisher)
+    #read the inital cpg parameters (will then be updated automatically by the "head" STM publisher on UART)
     print("[LOG] Reading CPG parameters")
     results = []
     results.append(framework.ServiceReadUART(REG_CPG_FREQUENCY))
@@ -147,7 +154,7 @@ def ThreadLog():
         print("[LOG] Error while reading CPG parameters")
     else:
         print("[LOG] CPG Parameters reading done")
-
+    
     #Logging Loop
     while thread_log_run:
         #wait for the robot to be activated
@@ -158,12 +165,15 @@ def ThreadLog():
                     break
         if thread_log_run:
             #create a new log file when the remote is turned on
-            print("Logging started")
+            print("Logging started\n> ", end="")
             now = datetime.now()
             log_cpg.new(now.strftime("logs/cpg_%d_%m_%Y_%H_%M_%S.csv"), joint_keys + energy_keys + power_keys, ["print"])
-            log_data = log_data_init.copy()
+            energy_offsets = {}
+            first_entry = True
+            log_data = {}
             log_data["time"] = int(operation["time"]*1000)
-            log_data["print"] = "freq {0} - dir {1} - amplc {2} - amplh {3} - nwave {4} - coupling {5} - a_r {6}".format(
+            #first entry of the logfile contains a "print" event with all the initial CPG value
+            log_print_queue.put("freq {0} - dir {1} - amplc {2} - amplh {3} - nwave {4} - coupling {5} - a_r {6}".format(
                 round(framework.RegisterRead(REG_CPG_FREQUENCY),2),
                 round(framework.RegisterRead(REG_CPG_DIRECTION),2),
                 round(framework.RegisterRead(REG_CPG_AMPLC),2),
@@ -171,70 +181,93 @@ def ThreadLog():
                 round(framework.RegisterRead(REG_CPG_NWAVE),2),
                 round(framework.RegisterRead(REG_CPG_COUPLING_STRENGTH),2),
                 round(framework.RegisterRead(REG_CPG_A_R),2)
-            )
-            log_cpg.write(log_data)
+            ))
+
         #Log the activity (setpoint publishing or CPG parameter change)
         while thread_log_run:
+            #wait for a new framework event (a register publication)
             while(framework.queue_event.empty()): pass
+            #update the log_data variable (used to write to the logfile) depending on the register operation that just happened
+            new_entry = False
             operation = framework.queue_event.get()
             log_data["time"] = int(operation["time"]*1000)
             log_data["print"] = None
+
+            #create a new entry when the setpoints are published
             if operation["address"] == REG_CPG_SETPOINTS:
                 for i in range(len(operation["value"])):
                     log_data[joint_keys[i]] = operation["value"][i]
-                log_cpg.write(log_data)
-            elif operation["address"] == REG_CPG_ENABLED:
-                log_data["print"] = "[Radio] enabled {0}".format(operation["value"])
-                log_cpg.write(log_data)
+                new_entry = True
+
+            #create a new entry if the CPG frequency parameter changed
             elif operation["address"] == REG_CPG_FREQUENCY:
-                log_data["print"] = "[Radio] frequency {0}".format(operation["value"])
-                log_cpg.write(log_data)
+                log_print_queue.put("[CPG] frequency {0}".format(operation["value"]))
+                new_entry = True
+
+            #create a new entry if the CPG direction parameter changed
             elif operation["address"] == REG_CPG_DIRECTION:
-                log_data["print"] = "[Radio] direction {0}".format(operation["value"])
-                log_cpg.write(log_data)
+                log_print_queue.put("[CPG] direction {0}".format(operation["value"]))
+                new_entry = True
+
+            #create a new entry if the CPG amplc parameter changed
             elif operation["address"] == REG_CPG_AMPLC:
-                log_data["print"] = "[Radio] amplc {0}".format(operation["value"])
-                log_cpg.write(log_data)
+                log_print_queue.put("[CPG] amplc {0}".format(operation["value"]))
+                new_entry = True
+
+            #create a new entry if the CPG amplh parameter changed
             elif operation["address"] == REG_CPG_AMPLH:
-                log_data["print"] = "[Radio] amplh {0}".format(operation["value"])
-                log_cpg.write(log_data)
+                log_print_queue.put("[CPG] amplh {0}".format(operation["value"]))
+                new_entry = True
+
+            #create a new entry if the CPG nwave parameter changed
             elif operation["address"] == REG_CPG_NWAVE:
-                log_data["print"] = "[Radio] nwave {0}".format(operation["value"])
-                log_cpg.write(log_data)
+                log_print_queue.put("[CPG] nwave {0}".format(operation["value"]))
+                new_entry = True
+
+            #create a new entry if the CPG coupling strength parameter changed
             elif operation["address"] == REG_CPG_COUPLING_STRENGTH:
-                log_data["print"] = "[Radio] coupling {0}".format(operation["value"])
-                log_cpg.write(log_data)
+                log_print_queue.put("[CPG] coupling {0}".format(operation["value"]))
+                new_entry = True
+
+            #create a new entry if the CPG ar parameter changed
             elif operation["address"] == REG_CPG_A_R:
-                log_data["print"] = "[Radio] ar {0}".format(operation["value"])
-                log_cpg.write(log_data)
+                log_print_queue.put("[CPG] ar {0}".format(operation["value"]))
+                new_entry = True
+
+            #update the log_data variable with the new energy or power readings
             elif operation["address"] == REG_MOTOR_ENERGY_FLOAT:
-                log_data["energy{0}".format(operation["source"]-2)] = round(operation["value"],2)
+                #use the first energy reading and use it as a zero
+                if (not ("energy{0}".format(operation["source"]-2) in energy_offsets)) or first_entry:
+                    energy_offsets["energy{0}".format(operation["source"]-2)] = operation["value"]
+                log_data["energy{0}".format(operation["source"]-2)] = round(operation["value"] - energy_offsets["energy{0}".format(operation["source"]-2)],2)
             elif operation["address"] == REG_MOTOR_POWER:
                 log_data["power{0}".format(operation["source"]-2)] = round(operation["value"],2)
+
+            #stop logging if the robot is stopped
             elif operation["address"] == REG_REMOTE_MODE:
                 if operation["value"] == 0:
-                    log_data["print"] = "[Radio] remote {0}".format(operation["value"])
                     log_cpg.write(log_data)
                     log_cpg.close()
-                    print("Logging stopped")
+                    print("Logging stopped\n> ", end="")
                     break
+            
+            #write a new logfile entry if needed
+            if new_entry:
+                if not log_print_queue.empty():
+                    log_data["print"] = log_print_queue.get()
+                first_entry = False
+                log_cpg.write(log_data)
 
-            if not log_data["print"] is None:
-                #print(log_data["print"])
-                pass
-
-
-
+#Start all the thread and give them a bit of time
 thread_uart_handle = threading.Thread(target=ThreadUart)
 thread_can_handle = threading.Thread(target=ThreadCan)
 thread_log_handle = threading.Thread(target=ThreadLog)
-
 thread_uart_handle.start()
 thread_can_handle.start()
 thread_log_handle.start()
-
 time.sleep(1)
 
+#main thread responsible for the shell interface
 try:
     shell_run = True
     print('Shell started, type "help" to get a list of supported commands')
@@ -251,32 +284,44 @@ try:
             for i in help_print:
                 print("{0} : {1}".format(i["command"].ljust(max_len, " "), i["description"]))
 
-        #Low level framework commands
+        #Read a register through CANFD1
         elif(command[0] == "canr"):
             value = framework.ServiceReadCAN(int(command[1],0), int(command[2],0))
             print("{0} ({1})".format("Error" if value is None else value, "Error" if value is None else hex(value)))
+
+        #Write a register through CANFD1
         elif(command[0] == "canw"):
             framework.ServiceWriteCAN(int(command[1],0), int(command[2],0), int(command[3],0))
+
+        #Read a register through UART
         elif(command[0] == "uartr"):
             value = framework.ServiceReadUART(int(command[1],0))
             if framework._RegisterGet(int(command[1],0))["type"] == REG_TYPE_FLOAT:
                 print("{0}".format("Error" if value is None else value))
             else:
                 print("{0} ({1})".format("Error" if value is None else value, "Error" if value is None else hex(value)))
+                
+        #Write a register through UART
         elif(command[0] == "uartw"):
             if framework._RegisterGet(int(command[1],0))["type"] == REG_TYPE_FLOAT:
                 framework.ServiceWriteUART(int(command[1],0), float(command[2]))
             else:
                 framework.ServiceWriteUART(int(command[1],0), int(command[2],0))
-        elif(command[0] == "uartall"):
-            for i in favourite_registers:
-                value = framework.ServiceReadUART(i["address"])
-                value = "Error" if value is None else value
-                print("{0} ({1}): {2}".format(i["name"], hex(i["address"]), value))
+
+        #Robot commands
+        elif(command[0] == "robot"):
+            if(command[1] == "start"):
+                framework.ServiceWriteUART(REG_REMOTE_MODE, 1)
+            elif(command[1] == "stop"):
+                framework.ServiceWriteUART(REG_REMOTE_MODE, 0)
 
         #CPG commands
         elif(command[0] == "cpg"):
-            if(command[1] == "freq"):
+            if(command[1] == "start"):
+                framework.ServiceWriteUART(REG_CPG_ENABLED, 2)
+            elif(command[1] == "stop"):
+                framework.ServiceWriteUART(REG_CPG_ENABLED, 0)
+            elif(command[1] == "freq"):
                 framework.ServiceWriteUART(REG_CPG_FREQUENCY, float(command[2]))
             elif(command[1] == "dir"):
                 framework.ServiceWriteUART(REG_CPG_DIRECTION, float(command[2]))
@@ -306,3 +351,6 @@ except Exception as e:
 framework.stop()
 thread_log_run = False
 print("[Shell] Stopped")
+#turn user LED OFF
+GPIO.output(23,0)
+GPIO.setup(23, GPIO.IN)

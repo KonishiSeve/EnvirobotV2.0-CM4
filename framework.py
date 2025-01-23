@@ -1,3 +1,4 @@
+# Created on Jan 21 2025 , Severin Konishi
 import can
 import serial
 import threading
@@ -18,7 +19,7 @@ REG_TYPE_FLOAT = ("float", 4, ">f")
 
 # Register event parameter
 EVENT_TYPE_NEVER = 0    #No event is triggered
-EVENT_TYPE_UPDATE = 1   #An event is triggered whenever the register is published with a different value than last time
+EVENT_TYPE_UPDATE = 1   #An event is triggered whenever the register is published with a different value than the local one
 EVENT_TYPE_ALWAYS = 2   #An event is triggered whenever the register is published
 
 # Operation types (Upper bits of the MSB of a framework payload)
@@ -29,12 +30,12 @@ OP_TYPE_READ_RES = 0b101
 OP_TYPE_ERROR = 0b110
 OP_TYPE_PUBLISH = 0b000
 
-#The TIMESTAMP corresponds to the last time the register value was updated
-# register  -> {"time": TIMESPAMP, "address": REGISTER_ADDRESS, "type": REG_TYPE, "value": VALUE, "length": LENGTH}
-# operation -> {"time": TIMESTAMP, "type": OP_TYPE, "source": SOURCE_ADDRESS, "address": ADDRESS, "value": VALUE}
+#Class that provides an access the register system of the robot through CANFD1 (with any STM32) or UART (with "head" STM32 only)
 class Framework:
     def __init__(self, verbose=False):
         #list of register dictionnaries
+        # register  -> {"time": TIMESPAMP, "address": REGISTER_ADDRESS, "type": REG_TYPE, "value": VALUE, "length": LENGTH}
+        #The TIMESTAMP corresponds to the last time the register value was updated
         self.registers = []
         #to control the CAN and UART threads
         self.thread_uart_running = True
@@ -47,7 +48,8 @@ class Framework:
 
         #initialize the CAN and UART buses
         self.bus_can = can.interface.Bus(channel="can0", bustype="socketcan", bitrate=1000000, dbitrate=4000000, fd=True)
-        self.bus_uart = serial.Serial("/dev/ttyAMA0", 115200, timeout=0.5, xonxoff=False, rtscts=False, dsrdtr=False) #ttyS0
+        self.bus_uart = serial.Serial("/dev/ttyAMA0", 115200, timeout=0.5, xonxoff=False, rtscts=False, dsrdtr=False)
+        self.bus_uart.flush()
         self.timeout_ms = 500    #timeout for an STM32 response when doing reads or writes
 
         #list of register addresses for which the local value will automatically be updated when there is a publication of the register
@@ -56,7 +58,8 @@ class Framework:
         self.registers_event_update = []
         #list of register addresses for which an "operation dictionary" will be added to the event queue when there is a publication of the register
         self.registers_event_always = []
-        #queue filled with publish operations, should be consummed by the user
+        #queue filled with publish operations, should be consummed by the user to use the event functionalities
+        # operation -> {"time": TIMESTAMP, "type": OP_TYPE, "source": SOURCE_ADDRESS, "address": ADDRESS, "value": VALUE}
         self.queue_event = queue.Queue()
 
         #set the time now as reference/zero for all the future timestamps
@@ -86,7 +89,7 @@ class Framework:
         else:
             if self.verbose: print("[Framework] Register {0} already exists".format(hex(address)))
 
-    #should only be used for registers with publish update enabled
+    #Used to read the local copy of a register
     def RegisterRead(self, address):
         register = self._RegisterGet(address)
         if register is None:
@@ -95,6 +98,7 @@ class Framework:
         if self.verbose: print("[Framework] Reading local register {0}: {1} ({2})".format(hex(address), register["value"], hex(register["value"])))
         return register["value"]
 
+    #A thread only running this method should be created by the user to allow the UART interface to work
     def ThreadUART(self):
         print("[Framework] UART Thread started")
         #contains only the "payload" part of the framework packet
@@ -108,7 +112,6 @@ class Framework:
             value_uart = self.bus_uart.read(1)
             #timeout
             if len(value_uart) == 0:
-                #index = 0
                 continue
             value_uart = value_uart[0]
             #first start byte
@@ -162,9 +165,11 @@ class Framework:
         self.bus_uart.close()
         print("[Framework] UART Thread stopped")
 
+    #A thread only running this method should be created by the user to allow the CANFD1 interface to work
     def ThreadCAN(self):
         print("[Framework] CAN Thread started")
         while(self.thread_can_running):
+            #wait for a CAN packet
             while True:
                 message = self.bus_can.recv(0.5)
                 if message != None:
@@ -172,6 +177,7 @@ class Framework:
                     break
                 elif self.thread_can_running:
                     return
+            #parse the CAN packet
             data = list(message.data)
             source = data[0]
             length = data[1]
@@ -182,26 +188,34 @@ class Framework:
                 self._OperationProcess(operation)
         print("[Framework] CAN Thread stopped")
 
+    #used to read a register through the UART interface
     def ServiceReadUART(self, address):
+        #check that register exists
         register = self._RegisterGet(address)
         if register is None:
             return None
+        #send read operation
         payload = self._PayloadEncode([{"time": None, "type": OP_TYPE_READ_REQ, "source": self.cm4_address, "address": address, "value": None}])
         last_time = register["time"]
         self._SendUart(payload)
+        #wait for UART thread to receive an answer (it will modify the register timestamp)
         start = time.time()
         while (self.thread_uart_running) and ((time.time()-start) < (self.timeout_ms/1000)):
             if(last_time < register["time"]):
                 return register["value"]
         return None
 
+    #used to write to a register through the UART interface
     def ServiceWriteUART(self, address, value):
+        #check that register exists
         register = self._RegisterGet(address)
         if register is None:
             return None
+        #send write operation
         last_time = register["time"]
         payload = self._PayloadEncode([{"time": None, "type": OP_TYPE_WRITE_REQ, "source": self.cm4_address, "address": address, "value": value}])
         self._SendUart(payload)
+        #wait for UART thread to receive an answer (it will modify the register timestamp)
         start = time.time()
         while (self.thread_uart_running) and ((time.time()-start) < (self.timeout_ms/1000)):
             if(last_time < register["time"]):
@@ -209,27 +223,36 @@ class Framework:
                 return True
         return None
 
+    #used to read a register through the CANFD1 interface
+    #"target_address" is the module address containing the target register
     def ServiceReadCAN(self, address, target_address):
+        #check that register exists
         register = self._RegisterGet(address)
         if register is None:
             return None
+        #send read operation
         payload = self._PayloadEncode([{"time": None, "type": OP_TYPE_READ_REQ, "source": self.cm4_address, "address": address, "value": None}])
         last_time = register["time"]
         self._SendCAN(payload, target_address)
-        #wait for the register to be updated
+        #wait for CAN thread to receive an answer (it will modify the register timestamp)
         start = time.time()
         while (self.thread_can_running) and ((time.time()-start) < (self.timeout_ms/1000)):
             if(last_time < register["time"]):
                 return register["value"]
         return None
 
+    #used to write to a register through the CANFD1 interface
+    #"target_address" is the module address containing the target register
     def ServiceWriteCAN(self, address, value, target_address):
+        #check that register exists
         register = self._RegisterGet(address)
         if register is None:
             return None
+        #send write operation
         payload = self._PayloadEncode([{"time": None, "type": OP_TYPE_WRITE_REQ, "source": self.cm4_address, "address": address, "value": None}])
         last_time = register["time"]
         self._SendCAN(payload, target_address)
+        #wait for UART thread to receive an answer (it will modify the register timestamp)
         start = time.time()
         while (self.thread_can_running) and ((time.time()-start) < (self.timeout_ms/1000)):
             if(last_time < register["time"]):

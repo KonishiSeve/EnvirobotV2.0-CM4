@@ -1,4 +1,9 @@
 #!/bin/bash
+# Created on Jan 21 2025 , Severin Konishi
+
+#used to flash the "head" STM32
+#command: sh flash_stm.sh filename.hex
+
 BOOT_PIN=25
 RESET_PIN=26
 USER_LED=23
@@ -12,7 +17,7 @@ raspi-gpio set $RESET_PIN dl
 
 #flasing
 sleep  1
-stm32flash -m 8e1 -b 115200 -w Envirobot_STM32_Head.hex -v /dev/ttyAMA0
+stm32flash -m 8e1 -b 115200 -w $1 -v /dev/ttyAMA0
 sleep  1
 
 #Disable boot mode

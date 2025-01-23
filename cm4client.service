@@ -1,0 +1,14 @@
+[Unit]
+Description=CM4 client autostart
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+Restart=always
+RestartSec=60
+ExecStart=/usr/bin/screen -L -dmS cm4client python /home/pi/CM4Client/CM4Client.py
+User=pi
+
+[Install]
+WantedBy=multi-user.target

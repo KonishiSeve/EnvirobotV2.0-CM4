@@ -1,6 +1,8 @@
+# Created on Jan 21 2025 , Severin Konishi
 import re
 import numpy as np
 
+#class to read and write logfiles for Envirobot V2.0
 class LogFile:
     def __init__(self):
         self.file_operation = False
@@ -34,8 +36,9 @@ class LogFile:
                     else:
                         self.state_keys.append(key)
     
-    #read the next variable values
+    #read the next entry
     def read(self):
+        #check that the "open" method was called first
         if self.file_operation == "r":
             data = {}
             line = (self.file.readline()).replace("\n", "")
@@ -68,7 +71,7 @@ class LogFile:
             #write the header of the csv file (the event names have an @ symbol at the end for the reader to recognize them)
             self.file.write(";".join(["time"] + self.state_keys + [i+"@" for i in self.event_keys]) + "\n")
 
-    #write an update to the state
+    #write a new entry
     def write(self, data):
         #check that the "new" method was called first
         if self.file_operation == "w":
@@ -94,7 +97,7 @@ class LogFile:
                 #write the time
                 self.file.write(str(data["time"]) + ";")
                 #write the states
-                for key in self.states:
+                for key in self.state_keys:
                     self.file.write(str(self.states[key]) + ";")
                 #write the events
                 for key in self.event_keys:
