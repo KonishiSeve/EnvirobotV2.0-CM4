@@ -51,12 +51,13 @@ thread_can_handle.start()
 ### Registers
 To be able to interact with a register, the user must first make the library aware of this register by adding it to the framework object.
 ```
-framework.RegisterAdd(0x022A, REG_TYPE_FLOAT, 0, subscribe_update=False, event_type=EVENT_TYPE_ALWAYS)
+framework.RegisterAdd(ADDRESS, REG_TYPE_FLOAT, SIZE, value=None, subscribe_update=False, event_type=EVENT_TYPE_ALWAYS)
 ```
 The library now knows the configuration of this register (which allows it to parse packets with operations related to this register) and keeps a local copy of the register content.\
-The first 3 arguments are the register address, register type (defined in the **framework.py** file) and default value for the local copy.\
-THe 4th argument tells the library to automatically update the local copy of the register when a publish packet for this register is received.\
-The 5th argument defines in what situation a library event should be created:\
+The first 3 arguments are the register address, register type (defined in the **framework.py** file) and register size (0 for single value variables, >0 for arrays).
+The 4th argument is the default value for the local copy.\
+THe 5th argument tells the library to automatically update the local copy of the register when a publish packet for this register is received.\
+The 6th argument defines in what situation a library event should be created:
 - EVENT_TYPE_NEVER:  No event is triggered
 - EVENT_TYPE_UPDATE: An event is triggered when a publish packet is received with a different value than the local one
 - EVENT_TYPE_ALWAYS: An event is triggered when a publish packet is received
