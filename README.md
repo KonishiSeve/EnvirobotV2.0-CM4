@@ -29,3 +29,62 @@ The compiled file must be a .hex file. The .elf files outputed by STM32CubeIDE h
 ### reset_stm.sh
 This bash script can be used to assert a reset on the NRST pin of the “head” STM32.
 Command: **bash reset_stm.sh**
+
+## framework.py
+This file is currently used for the **CM4Client.py** client, but It can also be reused for something else. Here is what should be considered when making a custom Python program based on the **framework.py** library.
+### Threads
+To allow the library to correctly properly process the packets incoming from the CANFD1 and UART buses, two threads must be created and ran in the user code:
+```
+framework = Framework()
+
+def ThreadUart():
+    framework.ThreadUART()
+
+def ThreadCan():
+    framework.ThreadCAN()
+
+thread_uart_handle = threading.Thread(target=ThreadUart)
+thread_can_handle = threading.Thread(target=ThreadCan)
+thread_uart_handle.start()
+thread_can_handle.start()
+```
+### Registers
+To be able to interact with a register, the user must first make the library make the library aware of this register by adding it to the framework object.
+```
+framework.RegisterAdd(0x022A, REG_TYPE_FLOAT, 0, subscribe_update=False, event_type=EVENT_TYPE_ALWAYS)
+```
+The library now knows the configuration of this register (which allows it to parse packets with operations related to this register) and keeps a local copy of the register content.
+The first 3 arguments are the register address, register type (defined in the **framework.py** file) and default value for the local copy.
+THe 4th argument tells the library to automatically update the local copy of the register when a publish packet for this register is received.
+The 5th argument defines in what situation a library event should be created:
+- EVENT_TYPE_NEVER:  No event is triggered
+- EVENT_TYPE_UPDATE: An event is triggered when a publish packet is received with a different value than the local one
+- EVENT_TYPE_ALWAYS: An event is triggered when a publish packet is received
+### Events
+When an event is triggered in the library, an "operation" dictionary is added to the "framework.queue_event" queue. This queue can then be read by the user to process the events as wished.
+The "operation" dictionnary is structured as such:
+```
+{"time": TIMESTAMP,
+ "type": OP_TYPE,
+ "source": SOURCE_ADDRESS,
+ "address": ADDRESS,
+ "value": VALUE}
+```
+TIMESTAMP is when the event happened.
+TYPE is the operation type, this should always be OP_TYPE_PUBLISH (defined in the **framework.py** file).
+SOURCE_ADDRESS is the module address from which the packet that triggered the event came from.
+ADDRESS is the concerned register address.
+VALUE is the register value.
+
+### Methods
+Once the register is added to the framework, library methods can be used to interact with it.
+
+**framework.RegisterRead(ADDRESS)** is used to read the value of the local value a register
+
+**framework.ServiceReadUART(ADDRESS)** is used to read the value of a register from the "head" STM32 through the UART bus. This will also update the local value of the register.
+
+**framework.ServiceWriteUART(ADDRESS, VALUE)** is used to write a value to a register from the "head" STM32 through the UART bus. This will also update the local value of the register.
+
+**framework.ServiceReadCAN(ADDRESS, MODULE_ADDRESS)** is used to read the value of a register from the any STM32 through the CANFD1 bus. This will also update the local value of the register.
+
+**framework.ServiceWriteCAN(ADDRESS, VALUE, MODULE_ADDRESS)** is used to write a value to a register from any STM32 through the CANFD1 bus. This will also update the local value of the register.
